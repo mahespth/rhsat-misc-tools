@@ -43,7 +43,7 @@ function switchUser
 
         $CMD clear_caches 2>/dev/null
 
-        eval $CMD -u admin login $DEVNULL | grep -q Connected
+        eval $CMD -u $1 login $DEVNULL | grep -q Connected
 
         if [[ $? != 0 ]]
         then
