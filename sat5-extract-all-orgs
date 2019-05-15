@@ -1,0 +1,357 @@
+#!/bin/ksh
+
+# Extract sat5 data for all orgs import into CMDB 
+###############################################################
+
+# __author__     = "Steve Maher"
+# __copyright__  = ""
+# __credits__    = ["Steve Maher"]
+# __license__    = ""
+# __version__    = ""
+# __maintainer__ = "Steve Maher"
+# __email__      = ""
+# __status__     = "Production"
+
+# Prep for iTop import.
+###############################################################
+function iTopCSV
+{
+        :
+        #       Name*   Description     Organization->Name      Business criticality    Move to production date Status  Virtual host->Name      OS family->Name OS version->Name OS licence->Name        CPU     RAM     IP      Organization->Full name Organization->Obsolete  Virtual host->Full name Virtual host->CI sub-class      Virtual host->Obsolete   OS family->Full name    OS version->Full name   OS licence->Full name   OS licence->Obsolete
+        #       Name*,IP address,MAC address,Comment,IP gateway,IP mask,Speed,Device->Name,Device->Full name,Device->CI sub-class,Device->Obsolete
+        #       Description,Subnet name,Owner organization->Name,IP*,IP Mask*,Owner organization->Full name,Owner organization->Obsolete
+        #       Name*,Vendor*,Version*,Type
+        #       Name*,Organization->Name,Usage limit,Description,Start date,End date,Key,Perpetual*,Software->Name,Organization->Full name,Organization->Obsolete,Software->Full name
+        #       Name*,Description,Organization->Name,Business criticality,Move to production date,System->Name,Software->Name,Software licence->Name,Path,Status,Organization->Full name,Organization->Obsolete,System->Full name,System->CI sub-class,System->Obsolete,Software->Full name,Software licence->Full name,Software licence->Obsolete
+        #       Name*,Description,Organization->Name,Business criticality,Move to production date,Status,Farm->Name,Server->Name,Organization->Full name,Organization->Obsolete,Farm->Full name,Farm->Obsolete,Server->Full name,Server->Obsolete
+
+}
+
+# Note that session files expire each day - not 24 hours but actual days.
+############################################################
+function switchUser
+{
+        [[ -n ${DEBUG} ]] && set -x
+
+        if [[ ! -s ~/etc/${1}.session ]]
+        then
+                print -u2 "[E] Failed to find session data for ${1}, stopping."
+                return 1
+        fi
+
+        cp ~/etc/${1}.session ~/.spacecmd/localhost/session 2>/dev/null
+
+        $CMD clear_caches 2>/dev/null
+
+        eval $CMD -u admin login $DEVNULL | grep -q Connected
+
+        if [[ $? != 0 ]]
+        then
+                print -u2 "[E] Failed to login as ${1}"
+                return 1
+        else
+                print "[I] Logged in as ${1}"
+        fi
+}
+
+function checkSession
+{
+        [[ -n ${DEBUG} ]] && set -x
+
+        # Check that session data is in place
+        ############################################################
+        for s_orgUser in ${!a_users[@]}
+        do
+                if [[ -s ~/etc/${s_orgUser}.session ]]
+                then
+                        # Note we cant use stat/find as its not in 24 hr periods
+                        # session file is encryped to the date
+                        ############################################################
+                        if ls -l ~/etc/${s_orgUser}.session 2>&1 | grep -q "${TODAY}"
+                        then
+                                :
+                        else
+                                rm ~/etc/${s_orgUser}.session
+                        fi
+                fi
+
+                if [[ ! -s ~/etc/${s_orgUser}.session ]]
+                then
+                        print "[W] ${s_orgUser} session data is missing - please login"
+
+                        if $CMD login ${s_orgUser}
+                        then
+                                cp ~/.spacecmd/localhost/session 2>/dev/null ~/etc/${s_orgUser}.session
+                        fi
+                fi
+        done
+}
+
+function interfacetxt2vars
+{
+        awk '
+        BEGIN {
+                chassisnim=1
+        }
+
+        /^Interface:/ {
+                if (!ifacnum++) {
+                        print "\"Interface\" {"
+                }
+
+                print "  \""$2"\" {"
+
+                while ( getline && length($0) ) {
+                        match($0,":");
+                        var=substr($0,1,RSTART-1); value=substr($0,RSTART+RLENGTH,999);
+                        gsub(/^[         ]+/,"",value)
+
+                        if (value ~ /^[0-9]+$/ ) {
+                                print "    \""var"\": "value","
+                        } else {
+                                print "    \""var"\": \""value"\","
+                        }
+                }
+
+                print "  },"
+        }
+
+        /^chassis:/ {
+                print "\"chassis-"chassisum++"\":\""$0"\","
+                }
+
+        /^(Count|Arch|MHz|Cache|Vendor|Model|RAM|Swap|Vendor|System|Product|Board|BIOS Release|BIOS Vendor|BIOS Version):/ {
+                if (!ifacedone++ && ifacenum) { print "}" }
+                match($0,":");
+                var=substr($0,1,RSTART-1); value=substr($0,RSTART+RLENGTH,999);
+                gsub(/^[         ]+/,"",value)
+
+                if (value ~ /^[0-9]+$/ ) {
+                        print "\""var"\": "value","
+                } else {
+                        print "\""var"\": \""value"\","
+                }
+        }
+
+        ' $@
+}
+
+function detailstxt2vars
+{
+        awk '
+        /[a-zA-Z]*:/ {
+                match($0,":");
+                var=substr($0,1,RSTART-1); value=substr($0,RSTART+RLENGTH,999);
+
+                gsub(/^[        ]+/,"",value)
+
+                if (value ~ /^[0-9]+$/ ) {
+                        print "\""var"\": "value","
+                } else {
+                        print "\""var"\": \""value"\","
+                }
+        }
+
+        /^Activation Keys/ {
+                keynum=1
+                while ( getline && length($0) ) {
+                        if (NF == 1 && $1 !~ /^-/ ) { print "\"activation-key-"keynum++"\":\""$0"\"," }
+                }
+        }
+
+        /^Entitlements/ {
+                keynum=1
+                while ( getline && length($0) ) {
+                        if (NF == 1 && $1 !~ /^-/ ) { print "\"entitlement-"keynum++"\":\""$0"\"," }
+                }
+        }
+
+        /^Software Channels/ {
+                keynum=1
+                while ( getline && length($0) ) {
+                        if (NF == 1 && $1 !~ /^-/ ) { print "\"software-channel-base\":\""$0"\"," }
+                        if (NF > 1 && $1 !~ /^-/ ) { print "\"software-channel-"keynum++"\":\""$2"\"," }
+                }
+        }
+
+        /^System Groups/ {
+                keynum=1
+                while ( getline && length($0) ) {
+                        #gsub(/[\[\]]}/,"");
+                        if (NF == 1 && $1 !~ /^-/ ) { print "\"system-groups-"keynum++"\":\""$0"\"," }
+                }
+        }
+        ' $@
+}
+
+
+if [[ $- == @(*x) || $1 == @(*-D*) ]]
+then
+        DEBUG=true
+        set -x
+else
+        DEVNULL="2>/dev/null"
+fi
+
+PS4='$LINENO | $@ | '
+
+typeset    CMD="spacecmd"
+typeset    TODAY=$( date +%b" "%d )     # Mmm DD
+typeset    STORE=~/var/rhs_inventory
+
+typeset -A a_users
+typeset -A a_orgs
+
+if [[ ! -d ~/etc ]]
+then
+        echo "[E] Failed to find ~/etc"
+        exit 1
+fi
+
+if [[ ! -d ~/var ]]
+then
+        echo "[E] Failed to find ~/var"
+        exit 1
+fi
+
+if [[ ! -d ${STORE} ]]
+then
+        if ! mkdir -p ${STORE}
+        then
+                print -u2 "[E] Could not create store"
+                exit 1
+        fi
+fi
+
+echo "[I] Writing data to ${STORE}"
+
+# Change to admin to gather org details and relevant user
+# accounts that we need
+############################################################
+a_users['admin']=1
+checkSession
+
+switchUser admin
+
+print "[I] Gathering ORGS and USER details"
+
+eval $CMD org_list $DEVNULL \
+| while read s_org
+do
+
+        $CMD org_listusers \"${s_org}\" 2>/dev/null \
+        | while read s_user
+        do
+                print "[I] ORG: ${s_org}        ${s_user}"
+
+                if [[ ${s_user} == @(*admin|adm*) ]]
+                then
+                        a_users[${s_user}]=''
+                        a_orgs["${s_org}"]="${s_user}"
+                fi
+        done
+done
+
+print "[I] Users: ${!a_users[@]}"
+
+checkSession
+
+# Now we should have all the org data and session data we
+# can start harvesting systems
+############################################################
+for s_org in "${!a_orgs[@]}"
+do
+        s_orgUser="${a_orgs["${s_org}"]}"
+        s_orgStore="${STORE}/${s_org// /-}"
+
+        if [[ ! -d "${s_orgStore}" ]]
+        then
+                if ! mkdir "${s_orgStore}"
+                then
+                        print -u2 "Failed to create directory ${s_orgStore}"
+                        exit 3
+                fi
+        fi
+
+        print "[I] Scanning ORG: ${s_org} ACCOUNT: ${s_orgUser}"
+
+        switchUser ${s_orgUser}
+
+        # Get systems that have not been reportng in
+        ############################################################
+        $CMD report_inactivesystems 2>/dev/null \
+        >${s_orgStore}/inactive-systems
+
+        # Example output
+        ############################################################
+        # System                           Hostname                        IP
+        # ------                           --------                        --
+        # xxxxxxxxxxxxx                    xxxxxxxxxxxxx                   xx.xx.xx.xx
+        ############################################################
+        $CMD report_ipaddresses \
+        | tee ${s_orgStore}/iaddresses \
+        | awk 'NR>2' \
+        | while read s_system s_hostname s_ip
+        do
+                # Example output:
+                ############################################################
+                # Name:          xxxxxxxxx.xxxxxx.local
+                # System ID:     xxxxxxxxxx
+                # UUID:          xxxxx
+                # Locked:        False
+                # Registered:    20160210T16:00:37
+                # Last Checkin:  20180830T10:59:24
+                # OSA Status:    online
+                # Last Boot:     20180629T11:59:38
+                #
+                # Hostname:      xxxxxxxxxx.xxxxxxx.local
+                # IP Address:    xx.xx.xx.xx
+                # Kernel:        3.10.0-229.el7.x86_64
+                #
+                # Activation Keys
+                # ---------------
+                # 5-xxxxxxxxxxxxxxxxxxxxx
+                #
+                # Software Channels
+                # -----------------
+                # rhel-x86_64-server-7
+                #   |-- rhel-x86_64-server-optional-7
+                #   |-- rhn-tools-rhel-x86_64-server-7
+                #
+                # Entitlements
+                # ------------
+                # enterprise_entitled
+                # provisioning_entitled
+                ############################################################
+
+                for cmd in system_details:details system_listevents:events \
+                        system_listhardware:hardware system_listinstalledpackages:packages  \
+                        system_listerrata:errata system_listcustomvalues:customvalues \
+                        system_listconfigfiles:configfiles
+                do
+                        # update only if over x days  old!?
+                        ############################################################
+                        if [[ ! -e ${s_orgStore}/${s_system}-${cmd##*:} ]]
+                        then
+                                $CMD ${cmd%%:*} ${s_system} 2>/dev/null \
+                                >${s_orgStore}/${s_system}-${cmd##*:}
+                        fi
+                        
+                        print -n "."
+                done
+
+                detailstxt2vars ${s_orgStore}/${s_system}-details \
+                >${s_orgStore}/${s_system}-import.dat
+
+                interfacetxt2vars ${s_orgStore}/${s_system}-hardware \
+                >>${s_orgStore}/${s_system}-import.dat
+        done
+
+        print "\n"
+done
+
+#system_listentitlements
+
+# all done.
+############################################################
+exit 0
