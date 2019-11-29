@@ -1,0 +1,176 @@
+#!/bin/bash
+
+# initialise the unbuntu build for docker 
+#  we should replace this with a ansible playbook...
+# 
+# Poseidon project.
+
+# Refs: https://superuser.com/questions/1380443/how-can-i-recreate-a-unique-identifier-for-dhcp-in-ubuntu-18-04
+# Refs: https://superuser.com/questions/1338510/wrong-ip-address-from-dhcp-client-on-ubuntu-18-04
+# Refs: https://wiki.archlinux.org/index.php/Systemd-networkd
+
+################################################################################
+
+# If having network problems check
+#    journalctl -u systemd-networkd -b 0 --no-pager  
+# we have had dhcp issues and have found several potention bugs that could
+# be causing this.
+
+if [ `id -u` -ne 0 ]
+then
+	echo "you need to be root.. run sudo and try again.."
+	exit 1
+fi
+
+set -v
+
+# Update all install packages
+################################################################################
+apt update -y
+
+# You really want to be sure before running this..
+################################################################################
+# apt upgrade -y
+
+# install packages
+################################################################################
+apt install -y open-vm-tools
+
+# cleanup apt
+################################################################################
+apt clean
+
+# Stop services before cleanup
+################################################################################
+service rsyslog stop
+
+# Clear loggs
+################################################################################
+for log in /var/log/wtmp /var/log/lastlog 
+do
+    if [ -f ${log} ]
+    then
+        truncate -s0 ${log}
+    fi
+done
+
+
+# cleanup tmp directories
+################################################################################
+rm -rf /tmp/* /var/tmp/* /var/log/vmware-network.*log /var/log/vmware-vmsc.*.log 
+
+# Remove any DHCP leases
+################################################################################
+rm -fR /var/lib/dhcp/dhclient.leases
+
+# wget history from tinkering with the build
+################################################################################
+rm -fR /root/.wget-hsts
+
+
+# Remove host keys
+################################################################################
+rm -f /etc/ssh/ssh_host_*
+
+# Create rc.local to regenerate keys and set hostname etc.
+################################################################################
+
+cat << 'EOL' | sudo tee /etc/rc.local
+#!/bin/sh -e
+#
+# rc.local
+#
+# This script is executed at the end of each multiuser runlevel.
+#
+# By default this script does nothing.
+
+# dynamically create hostname (optional)
+#if hostname | grep localhost; then
+#    hostnamectl set-hostname "$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 13 ; echo '')"
+#fi
+
+test -f /etc/ssh/ssh_host_dsa_key || dpkg-reconfigure openssh-server
+exit 0
+EOL
+################################################################################
+
+
+# make sure the script is executable
+################################################################################
+test -x /etc/rc.local || chmod +x /etc/rc.local
+
+# reset hostname
+# prevent cloudconfig from preserving the original hostname
+sed -i 's/preserve_hostname: true/preserve_hostname: false/g' /etc/cloud/cloud.cfg
+
+truncate -s0 /etc/hostname
+hostnamectl set-hostname localhost
+
+
+# disable swap???
+################################################################################
+# sudo swapoff --all
+# sudo sed -ri '/\sswap\s/s/^#?/#/' /etc/fstab
+
+# ensure set dhcp to use mac - this is a little bit of a hack
+# but I need this to be placed under the active nic settings
+# also look in /etc/netplan for other config files
+
+cp -p /etc/netplan/50-cloud-init.yaml /tmp/50-cloud-init.yaml
+
+if grep -qv 'dhcp-identifier: mac' /etc/netplan/50-cloud-init.yaml
+then
+    awk '{ 
+        print;
+   
+        if ($0 ~ /dhcp4: true/) {
+            match($0,/[ \t]+/,a)
+            printf("%s%s\n",a[0],"dhcp-identifier: mac")
+        }
+    }' /tmp/50-cloud-init.yaml >/etc/netplan/50-cloud-init.yaml
+
+    if [[ -e /etc/cloud/cloud.cfg.d/50-curtin-networking.cfg ]]
+    then
+        cp /etc/netplan/50-cloud-init.yaml /etc/cloud/cloud.cfg.d/50-curtin-networking.cfg 
+    fi
+fi
+
+#sed -i 's/optional: true/e/g' /etc/netplan/50-cloud-init.yaml
+#[[ -e /etc/netplan/50-cloud-init.yaml ]] && rm /etc/netplan/50-cloud-init.yaml
+
+
+# machine id needs to be removed so a new one is generated when provisioned
+# even though we are using ClientIdentified=mac sometimes this gets skipped
+# it appears when terraform/esx is having a moment - and this we end up 
+# using the machine-id if the plan is tainted and ru-run. 
+################################################################################
+if [[ -s /etc/machine-id ]]
+then
+    >/etc/machine-id
+fi
+
+# https://wiki.archlinux.org/index.php/Systemd-networkd
+################################################################################
+cat <<EOF >/etc/systemd/network/10-poseidon-dhcp.network 
+[Network]
+DHCP=yes
+
+[DHCP]
+ClientIdentifier=mac
+EOF
+
+# cleans out all of the cloud-init cache / logs
+# this is mainly cleaning out networking info
+################################################################################
+sudo cloud-init clean --logs
+
+# clean shell history
+################################################################################
+cat /dev/null > ~/.bash_history && history -c
+history -w
+
+# Shutdown the system - my work here is done..
+################################################################################
+
+echo "run: shutdown -h now"
+
